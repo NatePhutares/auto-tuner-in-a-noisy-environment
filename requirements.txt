@@ -1,0 +1,6 @@
+# Python prototype (python_prototype/) and PC-side tools (autotuner_f446re/laptop, pc_test)
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7      # plots in autotuner*.py --plot and evaluate.py
+sounddevice>=0.4     # live playback (playback.py) and rx_audio.py
+pyserial>=3.5        # rx_audio.py: UART audio stream from the board

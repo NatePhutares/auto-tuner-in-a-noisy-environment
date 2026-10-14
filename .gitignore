@@ -1,0 +1,40 @@
+# ---------- STM32CubeIDE ----------
+# Build output (rebuilt on every compile)
+**/Debug/
+**/Release/
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.map
+*.list
+*.bin
+*.hex
+
+# Leftover backups (git keeps history now)
+*.orig
+*.adc_version
+
+# ---------- Python ----------
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Generated audio (re-run the scripts to recreate)
+python_prototype/outputs/
+autotuner_f446re/laptop/*.wav
+
+# Large input recordings (keep only small test clips)
+python_prototype/wav_files/the_first_capture.wav
+python_prototype/wav_files/gibberish.wav
+python_prototype/wav_files/hello.wav
+python_prototype/wav_files/goblin.wav
+
+# ---------- Editor / OS ----------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
