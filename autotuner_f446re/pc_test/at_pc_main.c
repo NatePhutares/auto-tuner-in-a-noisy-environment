@@ -1,5 +1,5 @@
 /*
- * at_pc_main.c — runs the C auto-tuner on a PC, for checking it against autotuner_v2.py.
+ * at_pc_main.c — runs the C auto-tuner on a PC, for checking it against autotuner.py.
  * Not part of the STM32 build (pc_test is not a CubeIDE source folder).
  *
  *   gcc -O2 -std=c11 -Wall -Wextra -Wdouble-promotion -I../App/Inc ../App/Src/at_*.c ../App/Src/autotuner.c \

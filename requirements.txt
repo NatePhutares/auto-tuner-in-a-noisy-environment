@@ -4,3 +4,4 @@ scipy>=1.10
 matplotlib>=3.7      # plots in autotuner*.py --plot and evaluate.py
 sounddevice>=0.4     # live playback (playback.py) and rx_audio.py
 pyserial>=3.5        # rx_audio.py: UART audio stream from the board
+librosa>=0.10       # pYIN reference pitch for real recordings (wav_reference.py, --wav)

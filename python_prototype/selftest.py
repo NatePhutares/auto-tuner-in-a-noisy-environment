@@ -1,9 +1,14 @@
 """Block-level checks of the prototype against numbers in the design document.
 
-    python selftest.py
+    python selftest.py                                  # pipeline checks on the synthetic phrase / sustained A3
+    python selftest.py --wav wav_files/introduce.wav    # pipeline checks (6-8) on a real recording
 
 These are also the checks to repeat on the C port (same inputs, same thresholds).
+With --wav, sections 1-5 are unchanged (they test single blocks with exact tones), and the
+pipeline checks use the recording: the intended note is the nearest note of the pYIN reference
+(wav_reference.py) and the fixed-mode checks look at the voiced part of the recording.
 """
+import sys
 from dataclasses import replace
 
 import numpy as np
@@ -12,10 +17,14 @@ from scipy import signal
 import synth
 from autotuner import (MODE_FIXED, MODE_NEAREST, ST_MODE_FIXED, ST_OUT_OF_RANGE, ST_VOICED, AutoTuner,
                        Config, NoteTracker, PitchDetector, RangeMonitor, design_bandpass, display_lines,
-                       hz_to_midi, parse_note, run)
+                       hz_to_midi, note_name, parse_note, run)
 
 config = Config()
 failures = []
+WAV = sys.argv[sys.argv.index("--wav") + 1] if "--wav" in sys.argv else None
+if WAV:
+    import wav_reference
+    REF = wav_reference.make_wav_signal(WAV, config.fs)
 
 
 def check(name, ok, detail=""):
@@ -79,36 +88,73 @@ for m in [60.0, 60.0, 72.0, 60.0, 60.0]:                      # isolated octave 
 check("median removes a one-frame octave jump", abs(out[0] - 60) < 0.01, f"m_s {out[0]:.2f}")
 
 # 6. pipeline on a detuned sung phrase (clean): pitch correction and level
-for tau, limit in [(0.01, 6.0), (0.05, 12.0)]:
-    s = synth.make_test_signal(vibrato_cents=0)
-    y, tr_in = run(s["x"], replace(config, retune_tau_s=tau))
-    _, tr = run(s["x"], synthesize=False)
-    _, tr_out = run(y, synthesize=False)
-    L, N = len(s["f0"]), config.N
-    ne = tr["n_end"]
-    cs = np.concatenate([[0], np.cumsum(s["steady"])])
-    inside = (ne <= L) & (ne - N >= 0)
-    st = np.zeros(len(ne), bool)
-    st[inside] = (cs[ne[inside]] - cs[ne[inside] - N]) == N
-    inte = s["intended"][np.minimum(ne - N // 2, L - 1)]
+if WAV:
+    # A real recording has no exact truth and speech can sit below the detector's 80 Hz floor once shifted,
+    # so input and output are both measured with pYIN (independent of the prototype) on reference-voiced frames.
+    import librosa
 
-    def mean_err(t):
-        ok = st & t["voiced"]
-        return np.abs(100 * (hz_to_midi(t["f0"][ok]) - inte[ok])).mean()
+    def pyin_midi(y):
+        f, v, _ = librosa.pyin(np.asarray(y, float), fmin=40, fmax=1000, sr=config.fs, frame_length=1024,
+                               hop_length=config.H)
+        c = np.minimum(np.arange(len(f)) * config.H, len(y) - 1)
+        return np.where(v & REF["f0"][c].astype(bool), hz_to_midi(np.nan_to_num(f, nan=1.0)), np.nan)
 
-    e_in, e_out = mean_err(tr), mean_err(tr_out)
-    check(f"retune {tau * 1000:.0f} ms: mean cents error to intended note drops",
-          e_out < limit and e_out < e_in, f"{e_in:.1f} -> {e_out:.1f} cents")
-lvl = y.std() / s["x"].std()
-check("output level within 1 dB of input", abs(20 * np.log10(lvl)) < 1, f"{20 * np.log10(lvl):+.2f} dB")
-check("no NaN/inf in output", bool(np.isfinite(y).all()))
+    s = REF
+    m_in = pyin_midi(s["x"])
+    dev = lambda m: np.abs(100 * (m - np.round(m)))
+    for tau in (0.0, 0.01, 0.05):
+        y, _ = run(s["x"], replace(config, retune_tau_s=tau))
+        m_out = pyin_midi(y)
+        ok = np.isfinite(m_in) & np.isfinite(m_out)
+        e_in, e_out = dev(m_in[ok]).mean(), dev(m_out[ok]).mean()
+        check(f"retune {tau * 1000:.0f} ms: mean cents distance to the nearest note drops (pYIN, {ok.sum()} frames)",
+              e_out < e_in, f"{e_in:.1f} -> {e_out:.1f} cents (median {np.median(dev(m_in[ok])):.1f} -> "
+              f"{np.median(dev(m_out[ok])):.1f})")
+    v = s["f0"] > 0
+    y_dn, _ = run(s["x"], replace(config, denoise=False))
+    lvl = 20 * np.log10(y_dn[v].std() / s["x"][v].std())
+    check("output level within 1 dB of input on voiced speech (noise suppressor off)", abs(lvl) < 1, f"{lvl:+.2f} dB")
+    lvl_on = 20 * np.log10(y[v].std() / s["x"][v].std())
+    print(f"[INFO] level with the noise suppressor on (room noise removed as well)  {lvl_on:+.2f} dB")
+    check("no NaN/inf in output", bool(np.isfinite(y).all()))
+else:
+    for tau, limit in [(0.01, 6.0), (0.05, 12.0)]:
+        s = REF if WAV else synth.make_test_signal(vibrato_cents=0)
+        y, tr_in = run(s["x"], replace(config, retune_tau_s=tau))
+        _, tr = run(s["x"], synthesize=False)
+        _, tr_out = run(y, synthesize=False)
+        L, N = len(s["f0"]), config.N
+        ne = tr["n_end"] - config.denoise_delay      # detection runs after the denoiser: hop i analyses input up to n_end - delay
+        cs = np.concatenate([[0], np.cumsum(s["steady"])])
+        inside = (ne <= L) & (ne - N >= 0)
+        st = np.zeros(len(ne), bool)
+        st[inside] = (cs[ne[inside]] - cs[ne[inside] - N]) == N
+        inte = s["intended"][np.minimum(ne - N // 2, L - 1)]
+
+        def mean_err(t):
+            ok = st & t["voiced"]
+            return np.abs(100 * (hz_to_midi(t["f0"][ok]) - inte[ok])).mean()
+
+        def median_err(t):
+            ok = st & t["voiced"]
+            return np.median(np.abs(100 * (hz_to_midi(t["f0"][ok]) - inte[ok])))
+
+        e_in, e_out = mean_err(tr), mean_err(tr_out)
+        check(f"retune {tau * 1000:.0f} ms: mean cents error to intended note drops",
+              e_out < limit and e_out < e_in, f"{e_in:.1f} -> {e_out:.1f} cents "
+              f"(median {median_err(tr):.1f} -> {median_err(tr_out):.1f})")
+    lvl = y.std() / s["x"].std()
+    check("output level within 1 dB of input", abs(20 * np.log10(lvl)) < 1, f"{20 * np.log10(lvl):+.2f} dB")
+    check("no NaN/inf in output", bool(np.isfinite(y).all()))
 
 # 7. streaming equals offline (process_hop in a loop is what the MCU does) and PSOLA history is bounded
-tuner = AutoTuner(config, max_samples=len(s["x"]) + 4096)
-xp = np.zeros(int(np.ceil((len(s["x"]) + 1000) / config.H)) * config.H)
+pre = config.denoise_delay                         # run() drops the denoiser delay from the front of the output
+n_pad = int(np.ceil((len(s["x"]) + pre + config.psola_delay + 2 * config.H) / config.H)) * config.H
+tuner = AutoTuner(config, max_samples=n_pad + 4096)
+xp = np.zeros(n_pad)
 xp[:len(s["x"])] = s["x"]
 chunks = [tuner.process_hop(xp[i:i + config.H])[1] for i in range(0, len(xp), config.H)]
-ys = np.concatenate(chunks)[:len(s["x"])]
+ys = np.concatenate(chunks)[pre:pre + len(s["x"])]
 check("streaming output == offline output", np.allclose(ys, run(s["x"], config)[0][: len(ys)], atol=1e-12))
 check("PSOLA only touches the last 1024 samples", True, "(asserted inside TDPSOLA._ola on every grain)")
 
@@ -135,30 +181,69 @@ def info(name, detail):
     print(f"[INFO] {name}  {detail}")
 
 
-xa3 = sustained(57)                                             # A3 sung
+if WAV:
+    xa3 = REF["x"]
+    _, _tr = run(xa3, synthesize=False)
+    sung = int(round(float(np.median(_tr["m_s"][(_tr["voiced"] > 0) & REF["speech"][np.minimum(
+        _tr["n_end"] - config.denoise_delay - config.N // 2, len(xa3) - 1)]]))))
+    _vref = REF["f0"] > 0
+    _t = np.flatnonzero(_vref) / config.fs
+    SEG = (float(_t.min()) + 0.05, float(_t.max()))          # voiced part of the recording
+
+    def out_pitch(y, lo=None, hi=None):
+        """Median output pitch (pYIN) over reference-voiced frames, and the share of them pYIN finds voiced."""
+        m = pyin_midi(y)
+        c = np.minimum(np.arange(len(m)) * config.H, len(y) - 1)
+        win = _vref[c]
+        sel = win & np.isfinite(m)
+        return (float(np.median(m[sel])) if sel.any() else float("nan")), sel.sum() / win.sum()
+
+    cases = [(sung + 3, sung + 3, False, True), (sung + 7, sung + 7, False, True), (sung + 12, sung + 12, False, True),
+             (sung - 5, sung - 5, False, True), (sung - 12, sung - 12, False, True),
+             (sung + 27, sung + 12, True, False), (max(24, sung - 20), sung - 12, True, False)]
+    print(f"       recording: median sung note {note_name(sung)} ({sung}), voiced reference {SEG[0]:.2f}..{SEG[1]:.2f} s")
+    LVL = slice(int(SEG[0] * config.fs), int(SEG[1] * config.fs))
+    VFRAC = 0.6                                                    # speech: consonants and glides inside words
+else:
+    xa3 = sustained(57)                                             # A3 sung
+    sung = 57
+    cases = [(60, 60, False, True), (50, 50, False, True), (46, 46, False, True),
+             (69, 69, False, True), (84, 69, True, True), (30, 45, True, True)]
+    LVL = slice(8000, 22000)
+    VFRAC = 0.9
 # (target, expected output, out_of_range expected, pitch is checked)
-for tgt, want, oor_want, strict in [(60, 60, False, True), (50, 50, False, True), (46, 46, False, True),
-                                     (69, 69, False, True), (84, 69, True, True), (30, 45, True, True)]:
+for tgt, want, oor_want, strict in cases:
     y, tr = run(xa3, replace(config, mode=MODE_FIXED, target_midi=tgt))
     p, vfrac = out_pitch(y)
     v = tr["voiced"].astype(bool)
-    late = v & ((tr["n_end"] - config.N // 2) / config.fs > 0.5)
-    oor = bool(tr["oor"][late].all()) if oor_want else bool(tr["oor"].any())
+    late = v & ((tr["n_end"] - config.N // 2) / config.fs > (SEG[0] if WAV else 0.5))
+    if WAV:                                                     # only the voiced part: the room noise before and after
+        tc_ = (tr["n_end"] - config.N // 2 - config.denoise_delay) / config.fs   # the speech is not the sung note
+        late = late & (tc_ >= SEG[0]) & (tc_ <= SEG[1])
+        seg_ = (tc_ >= SEG[0]) & (tc_ <= SEG[1])
+        oor_share = float(np.mean(tr["oor"][seg_ & v]))
+        oor = bool(oor_share > 0.9) if oor_want else bool(tr["oor"][seg_].any())
+    else:
+        oor = bool(tr["oor"][late].all()) if oor_want else bool(tr["oor"].any())
     d_ok = np.allclose(tr["d"][late], np.clip(tgt - tr["m_s"][late], -12, 12), atol=1e-9)
-    lvl = 20 * np.log10(y[8000:22000].std() / xa3[8000:22000].std())
-    detail = f"d {want - 57:+d} st, output {p:.2f}, voiced {100 * vfrac:.0f}%, level {lvl:+.1f} dB"
-    check(f"fixed A3 -> {tgt}: shift {want - 57:+d} st, out_of_range {'set' if oor_want else 'clear'}",
-          d_ok and oor == oor_want and bool(np.isfinite(y).all()), f"flag {'set' if oor else 'clear'}")
+    lvl = 20 * np.log10(y[LVL].std() / xa3[LVL].std())
+    detail = f"d {want - sung:+d} st, output {p:.2f}, voiced {100 * vfrac:.0f}%, level {lvl:+.1f} dB"
+    check(f"fixed {note_name(sung)} -> {note_name(tgt)} ({tgt}): shift {want - sung:+d} st, "
+          f"out_of_range {'set' if oor_want else 'clear'}",
+          d_ok and oor == oor_want and bool(np.isfinite(y).all()),
+          f"flag {'set' if oor else 'clear'}" + (f" (on {100 * oor_share:.0f}% of voiced hops)" if WAV else ""))
     if strict:
-        check(f"  output pitch reaches {want} within 15 cents", abs(p - want) * 100 < 15 and vfrac > 0.9, detail)
+        check(f"  output pitch reaches {want} within 15 cents", abs(p - want) * 100 < 15 and vfrac > VFRAC, detail)
     else:
         info(f"  output pitch {p:.2f} (not checked)", detail)
 
+low = sung - 7 if WAV else 50
 for st in (0.0, 1.0):                                           # grain stretch must not move the pitch
-    p, vfrac = out_pitch(run(xa3, replace(config, mode=MODE_FIXED, target_midi=50, grain_stretch=st))[0])
-    check(f"grain_stretch {st}: A3 -> D3 still lands on 50", abs(p - 50) * 100 < 15 and vfrac > 0.9, f"output {p:.2f}")
+    p, vfrac = out_pitch(run(xa3, replace(config, mode=MODE_FIXED, target_midi=low, grain_stretch=st))[0])
+    check(f"grain_stretch {st}: {note_name(sung)} -> {note_name(low)} still lands on {low}",
+          abs(p - low) * 100 < 15 and vfrac > VFRAC, f"output {p:.2f}")
 
-y, tr = run(xa3, replace(config, mode=MODE_FIXED, target_midi=84))
+y, tr = run(xa3, replace(config, mode=MODE_FIXED, target_midi=sung + 27 if WAV else 84))
 v = tr["voiced"].astype(bool)
 st = set(tr["status"][tr["oor"].astype(bool) & v])
 check("status byte on voiced out-of-range hops = 0x07", st == {ST_OUT_OF_RANGE | ST_MODE_FIXED | ST_VOICED},
@@ -180,13 +265,16 @@ bounce = [rm.update(g) for g in [13.0, 13.0, 13.0, 12.0] * 5]
 check("debounce: interrupted runs do not set the flag", not any(bounce))
 
 # commands from the laptop take effect at a hop boundary; nearest mode never flags
-y, tr = run(xa3, config, commands=[(0.6, {"mode": MODE_FIXED, "target": "C6"}), (1.2, {"mode": MODE_NEAREST})])
+T_ON, T_OFF = ((round(SEG[0] + 0.3, 2), round(SEG[0] + 1.2, 2)) if WAV else (0.6, 1.2))
+y, tr = run(xa3, config, commands=[(T_ON, {"mode": MODE_FIXED, "target": "C6"}), (T_OFF, {"mode": MODE_NEAREST})])
 t0 = tr["n_end"] - config.H
-fixed = (t0 >= 0.6 * config.fs) & (t0 < 1.2 * config.fs)
+fixed = (t0 >= T_ON * config.fs) & (t0 < T_OFF * config.fs)
 check("mode command applied from the next hop", bool((tr["mode"][fixed] == MODE_FIXED).all()
                                                        and (tr["mode"][~fixed] == MODE_NEAREST).all()))
-check("nearest mode clears out_of_range", not tr["oor"][t0 >= 1.2 * config.fs].any())
-check("nearest mode |d| <= 0.5 st on a clean note", np.abs(tr["d"][~fixed & tr["voiced"].astype(bool)]).max() <= 0.5 + 1e-9)
+check("nearest mode clears out_of_range", not tr["oor"][t0 >= T_OFF * config.fs].any())
+_dn = np.abs(tr["d"][~fixed & tr["voiced"].astype(bool)])
+check("nearest mode |d| <= 0.5 st" + ("" if WAV else " on a clean note"), _dn.max() <= 0.5 + 1e-9,
+      f"max {_dn.max():.2f} st, {100 * np.mean(_dn > 0.5 + 1e-9):.0f}% of voiced hops above 0.5")
 
 # display text
 info = dict(mode=MODE_FIXED, voiced=True, target=84, m_s=57.1, oor=True)

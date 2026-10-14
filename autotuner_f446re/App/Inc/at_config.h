@@ -1,5 +1,5 @@
 /*
- * at_config.h — every constant and tunable of the auto-tuner (C port of autotuner_v2.py, class Config).
+ * at_config.h — every constant and tunable of the auto-tuner (C port of autotuner.py, class Config).
  *
  * Two kinds of values:
  *   1. #define sizes  : fixed at compile time because they size arrays (fs, N, H, FFT, rings).
@@ -111,7 +111,7 @@ typedef struct {
     int     oor_frames;          /* 6                                                                */
 } at_config_t;
 
-/* Fill cfg with the autotuner_v2.py defaults. */
+/* Fill cfg with the autotuner.py defaults. */
 void at_config_default(at_config_t *cfg);
 
 #endif /* AT_CONFIG_H */

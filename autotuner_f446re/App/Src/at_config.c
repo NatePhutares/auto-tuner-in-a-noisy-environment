@@ -1,5 +1,5 @@
 /*
- * at_config.c — default values, identical to the Config dataclass in autotuner_v2.py.
+ * at_config.c — default values, identical to the Config dataclass in autotuner.py.
  */
 #include "at_config.h"
 

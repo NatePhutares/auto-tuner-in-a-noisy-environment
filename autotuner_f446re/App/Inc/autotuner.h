@@ -1,6 +1,6 @@
 /*
  * autotuner.h — the whole auto-tuner pipeline, one call per 128-sample hop.
- * C port of autotuner_v2.py (class AutoTuner). This is the only header main.c needs.
+ * C port of autotuner.py (class AutoTuner). This is the only header main.c needs.
  *
  *   mic -> noise suppressor (at_denoise)
  *            |-> detection: 75 Hz-1 kHz band-pass (at_biquad) -> FFT autocorrelation (at_pitch)

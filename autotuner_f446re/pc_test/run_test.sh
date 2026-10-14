@@ -1,5 +1,5 @@
 #!/bin/sh
-# run_test.sh — build the C auto-tuner for the PC and compare it with autotuner_v2.py.
+# run_test.sh — build the C auto-tuner for the PC and compare it with autotuner.py.
 #   sh run_test.sh ../../python_prototype/wav_files/introduce.wav            (nearest mode)
 #   sh run_test.sh ../../python_prototype/wav_files/introduce.wav C4         (fixed mode, target C4)
 # Needs gcc (Windows: MSYS2 / WSL) and python with numpy + scipy.

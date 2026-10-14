@@ -1,4 +1,4 @@
-"""make_golden.py — run autotuner_v2.py on a WAV and save reference vectors for the C port.
+"""make_golden.py — run autotuner.py on a WAV and save reference vectors for the C port.
 
     python make_golden.py ../../python_prototype/wav_files/introduce.wav gold_intro            # nearest mode
     python make_golden.py ../../python_prototype/wav_files/introduce.wav gold_intro_C4 --target C4   # fixed mode
@@ -10,7 +10,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "python_prototype"))
-import autotuner_v2 as at  # noqa: E402
+import autotuner as at  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("wav")

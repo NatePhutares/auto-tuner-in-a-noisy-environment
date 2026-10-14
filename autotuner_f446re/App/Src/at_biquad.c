@@ -1,5 +1,5 @@
 /*
- * at_biquad.c — biquad cascade + the two coefficient sets of autotuner_v2.py.
+ * at_biquad.c — biquad cascade + the two coefficient sets of autotuner.py.
  *
  * Coefficients were printed from the Python prototype (fs = 16000):
  *     signal.butter(2, [75, 1000], btype="bandpass", fs=16000, output="sos")

@@ -1,6 +1,6 @@
-# C port of `autotuner_v2.py`: what was added and why
+# C port of `autotuner.py`: what was added and why
 
-Written 14 Oct 2026. The C code on the STM32F446RE now runs the same pipeline as `python_prototype/autotuner_v2.py` (including the SNR gate added to both on 14 Oct, §4) (default settings: noise suppressor, LPC source-filter TD-PSOLA with cross-correlation pitch marks, dry crossfade, level match, pause gate, NEAREST and FIXED modes). The mic input path you already had working (`slot_to_s24`, `hop_to_pcm`, `MIC_SHIFT`, `MIC_GAIN_Q8`) is untouched.
+Written 14 Oct 2026. The C code on the STM32F446RE now runs the same pipeline as `python_prototype/autotuner.py` (including the SNR gate added to both on 14 Oct, §4) (default settings: noise suppressor, LPC source-filter TD-PSOLA with cross-correlation pitch marks, dry crossfade, level match, pause gate, NEAREST and FIXED modes). The mic input path you already had working (`slot_to_s24`, `hop_to_pcm`, `MIC_SHIFT`, `MIC_GAIN_Q8`) is untouched.
 
 ---
 
@@ -38,7 +38,7 @@ main.c  (I2S DMA callback → hop_ready)            unchanged mic code: 24-bit s
        │    └─ at_psola_push                       at_psola.c    residual → marks → grains → 1/A(z)
        │         └─ at_xfade_run / at_level_run / at_gate_run   at_post.c
        ├─ uart_packet_send(out, f0, target, status)  uart_packet.c (unchanged)
-       ├─ update_oor_stats / app_screen_draw       app_main.c / app_screen.c   OLED content (5 Hz + after commands)
+       ├─ update_sung_note / app_screen_draw       app_main.c / app_screen.c   OLED content (5 Hz + after commands)
        └─ oled_flush / oled_poll                   oled.c        one OLED page per hop by I2C DMA
 ```
 
@@ -64,10 +64,10 @@ All DSP files start with `at_` (auto-tuner). Each module keeps **all of its stat
 | `at_display` | `display_lines()` | Port of the Python two-line display text (`Target: C4    [FIXED]` / `Sung: A3  +3 st`). **Not used any more**: the OLED shows the layout in `app_screen` instead. Kept for reference; safe to delete. | — |
 | `oled_gfx` | (none: MCU only) | 128×64 framebuffer in the controller's page layout, 5×7 font, text at any scale. No hardware, so it can be tested on the PC. | change the font or add drawing functions. |
 | `oled` | (none: MCU only) | I2C driver for SH1106 (default, 1.3") or SSD1306 (0.96"): finds the display at 0x3C/0x3D, init sequence, and non-blocking refresh: one 135-byte page per hop by I2C DMA (a screen takes 64 ms and never blocks the audio). Defines `HAL_I2C_ErrorCallback`. If no display answers, it does nothing and everything else runs. | the screen stays black or is shifted (§4, "OLED"). |
-| `app_screen` | (none: MCU only) | What the OLED shows: `mode:`, `target:` (`-` in NEAREST), `oor_percent:` (`-` in NEAREST). Labels small, values large and right-aligned. | change the screen layout. |
+| `app_screen` | (none: MCU only) | What the OLED shows: `mode:`, `target:` (`-` in NEAREST), `sung:` (note being sung, `-` when silent). Labels small, values large and right-aligned. | change the screen layout. |
 | `at_command` | `set_mode`, `set_target` | Parses the three text commands `set mode nearest`, `set mode fixed`, `target <note>` (case-insensitive). Pure text, no hardware, so it can be tested on the PC. | add a new command (also add it to `parse_command()` in `rx_audio.py`). |
 | `uart_cmd` | (none: MCU only) | USART2 RX: the interrupt stores bytes in a ring, and the main loop takes complete lines. Defines `HAL_UART_RxCpltCallback` and `HAL_UART_ErrorCallback`. | change how commands arrive (e.g. add the B1 button). |
-| `app_main` | `run()` (real-time version) | Connects hardware and DSP: int16 ↔ float (÷32768, same scaling as your recorded WAVs), commands, DWT cycle measurement, UART packet, out-of-range statistics for `oor_percent`, OLED refresh. Holds the `autotuner_t` instance (static, ~80 kB). | change what is sent to the laptop, what is measured, or how `oor_percent` is counted (`update_oor_stats`). |
+| `app_main` | `run()` (real-time version) | Connects hardware and DSP: int16 ↔ float (÷32768, same scaling as your recorded WAVs), commands, DWT cycle measurement, UART packet, out-of-range statistics (Live Expressions only), the sung note for the OLED (`update_sung_note`, holds the last note 200 ms), OLED refresh. Holds the `autotuner_t` instance (static, ~80 kB). | change what is sent to the laptop, what is measured, or how the out-of-range share is counted (`update_oor_stats`). |
 
 ### Changed files
 
@@ -83,7 +83,7 @@ All DSP files start with `at_` (auto-tuner). Each module keeps **all of its stat
 | File | Purpose |
 |---|---|
 | `at_pc_main.c` | Runs the C auto-tuner on raw int16 audio on the PC; writes the output (delay removed, aligned like Python `run()`) and a `hops.csv` with the same columns as the Python golden CSV. |
-| `make_golden.py` | Runs `autotuner_v2.py` on a WAV and saves `input_q15.raw`, `output_q15.raw`, `hops.csv` (uses Python's `export_golden`). |
+| `make_golden.py` | Runs `autotuner.py` on a WAV and saves `input_q15.raw`, `output_q15.raw`, `hops.csv` (uses Python's `export_golden`). |
 | `compare.py` | Compares C and Python: voicing/target/status agreement, pitch difference in cents, output level. |
 | `run_test.sh` | Does all three: `sh run_test.sh ../../python_prototype/wav_files/introduce.wav C4`. Needs gcc (MSYS2 or WSL on Windows). Writes `out_c.wav` to listen to. |
 
@@ -114,7 +114,7 @@ Commands are case-insensitive. The script checks them first (`[error] not a note
 | `app_cycles_last`, `app_cycles_max` | DWT cycles of one `autotuner_process_hop()`; budget = 1 440 000 (8 ms at 180 MHz) |
 | `app_deadline_miss`, `hop_overruns` | hops that took too long / arrived before the previous one was done; both should stay 0 |
 | `app_info` | pitch, confidence, sung MIDI, target, shift, alpha, status of the last hop |
-| `app_oor_voiced`, `app_oor_count` | fixed mode: voiced hops / out-of-range hops since the last mode or target change (`oor_percent` = count / voiced) |
+| `app_oor_voiced`, `app_oor_count` | fixed mode: voiced hops / out-of-range hops since the last mode or target change (out-of-range share = count / voiced; not shown on the OLED) |
 | `oled_present`, `oled_address`, `oled_frames`, `oled_errors` | 1 if the display answered at 0x3C/0x3D; screens sent (should grow by ~5 per second); I2C errors |
 | `app_cmd_ok`, `app_cmd_rejected` | command lines accepted / rejected by the MCU |
 | `pkt_dropped` | UART packets dropped (should stay 0) |
@@ -124,9 +124,9 @@ Commands are case-insensitive. The script checks them first (`[error] not a note
 ```
 mode:        FIXED          mode:      NEAREST
 target:         C5          target:          -
-oor_percent:   12%          oor_percent:     -
+sung:           A4          sung:          C#4
 ```
-`oor_percent` = out-of-range share of the voiced hops since the last `set mode` / `target` change (it restarts at 0 % when you change either). The screen redraws 5 times a second and right after a command.
+`sung` = the note being sung: the median-smoothed pitch rounded to the nearest note. Room noise also passes the tuner's voicing test (confidence ≈ 0.6 > 0.5) and its "pitch" jumps around, so the screen only shows a note with confidence ≥ 0.6 that stays the same for 40 ms (`SUNG_CONF_MIN`, `SUNG_STABLE_HOPS` in `app_main.c`). On the recordings in `wav_files/` that shows a note for 92–98 % of hummed or sung hops, while noise alone shows one 0–6 % of the time; other people talking still can, since that really is a pitched voice. It shows `-` when nobody is singing; the last note is held for 200 ms so short consonants and breaths don't blank it. The screen redraws 5 times a second and right after a command.
 
 The controller is chosen in `App/Inc/oled.h` (`OLED_CONTROLLER`, default `OLED_SH1106` for 1.3" modules):
 - **screen stays black** but `oled_present` = 1 → it's an SSD1306: set `OLED_SSD1306`;
@@ -158,7 +158,7 @@ Pink/brown (bass-heavy) noise improves only slightly: its slow level swings look
 
 ## 5. How it was verified
 
-1. **Golden vectors:** `autotuner_v2.py` was run on `introduce.wav` and `the_first_capture.wav` (53.6 s), in NEAREST and in FIXED (target C4).
+1. **Golden vectors:** `autotuner.py` was run on `introduce.wav` and `the_first_capture.wav` (53.6 s), in NEAREST and in FIXED (target C4).
 2. **Detection path:** voicing, target note and status byte agree on **100 %** of hops (6 705 hops on the long capture); sung pitch differs by at most **0.01 cent**.
 3. **Shifter logic:** a test build of the same C code in double precision, given the same first pitch mark as Python, reproduces the Python output **bit for bit** (all 2 573 pitch marks and 2 423 grains identical, output SNR 217–219 dB on both files and both modes). So every step of the port is algorithmically identical to the prototype.
 4. **Real float32 build:** the waveform is not sample-identical to Python, and this is expected. The very first pitch mark is chosen as "largest |residual| in the first period", which falls in digital near-silence (~10⁻¹³). Float32 vs float64 rounding picks a different sample there, and every later mark follows from it, so the grains are cut at a different (equally valid) phase. Measured by what you hear, the float32 C output differs from Python **as much as Python differs from itself** when only its first mark is moved by 5 samples (median output-pitch difference 3–6 cents in both cases, same output level within 0.1 dB).
@@ -195,4 +195,4 @@ Tested in the emulator: the same results (pitch identical to 4 decimals), about 
 - **`HAL_UART_RxCpltCallback` lives in `uart_cmd.c`, `HAL_I2C_ErrorCallback` in `oled.c`.** If another module needs one of them later, forward from there; don't define it twice.
 - **Commands take effect at the next hop**, never in the middle of one: the interrupt only buffers bytes.
 - **The command words live in two places:** `at_command.c` (MCU) and `parse_command()` in `rx_audio.py` (checks before sending). Change both together.
-- **Python is still the reference.** If you change the algorithm, change `autotuner_v2.py` first, then the matching `at_*.c` (the table in §3 tells you which), then run `pc_test/run_test.sh`.
+- **Python is still the reference.** If you change the algorithm, change `autotuner.py` first, then the matching `at_*.c` (the table in §3 tells you which), then run `pc_test/run_test.sh`.

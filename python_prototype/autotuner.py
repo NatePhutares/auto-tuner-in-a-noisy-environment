@@ -1,4 +1,32 @@
-"""Auto-Tuner in a Noisy Environment -- Python reference prototype.
+"""Auto-Tuner in a Noisy Environment -- Python reference prototype (v2).
+
+v2 changes (13 Oct 2026, after the first real-mic test):
+  * noise suppressor (STFT Wiener gain, minimum-statistics noise tracking) in front of everything.
+    v1 only band-passed the *detection* path, so room noise went straight to the output, and the
+    low-frequency noise made the voiced/unvoiced flag flicker (noise got pitch-shifted too).
+  * pitch marks follow the previous grain by cross-correlation instead of peak-picking
+    (on the real recording peak-picking jumped >10 % between consecutive periods 54 % of the time).
+  * source-filter split: LPC residual is shifted, the vocal-tract filter 1/A(z) is applied afterwards,
+    and when lowering the excitation grains are stretched (longer glottal pulses, formants unchanged).
+    Plain TD-PSOLA left short pulses with gaps -> buzzy/robotic when lowering a lot.
+  * pause gate after the shifter: a further -25 dB between phrases (hold 150 ms, 20 ms lookahead).
+    Default: opens only on pitched (voiced) hops, and a hop holding > 90 % of its frame's energy counts as
+    a click, so finger snaps, taps and handling noise in pauses are removed. --gate-level also opens it
+    on loud unpitched sounds (keeps word-initial s/t/k, lets snaps through).
+  * 14 Oct 2026, SNR gate: in the default pitch-only mode the gate also needs the hop to stand
+    gate_snr_db (6 dB) above the tracked background floor. Steady noise (fan, white/pink/brown noise)
+    scores ~0.55 pitch confidence after the band-pass + denoiser, so before this only the absolute
+    -40 dBFS level floor kept it out, and loud noise opened the gate. The floor now rises fast on
+    unvoiced hops (it catches up within ~1-2 s when the noise gets louder) and slowly on voiced
+    hops (a long held note does not pull the floor up to itself). --gate-snr 0 gives the old gate.
+    Measured (white/bright noise at -20 dBFS): gate open ~99 % -> ~30 % of the time; voice in a quiet
+    room fully kept. Limit: when the noise is nearly as loud as the voice, the gate also closes on
+    the voice (lower gate_snr_db keeps more voice, higher rejects more noise). Pink/brown noise is
+    only slightly improved: its slow level swings look like voice to a single-mic gate.
+  * cost: algorithmic latency 25 ms -> about 62 ms (24 ms denoiser + 38 ms shifter lookahead).
+  * --stretch sets how much the excitation is stretched when lowering (default 0.135; 1.0 sounded
+    like slow motion).
+  --classic gives the v1 behaviour of the shifter (denoiser stays on unless --no-denoise).
 
 Streaming, hop-by-hop implementation of the pipeline design document.
 Everything is organised the way the C port on the STM32 will be: one call
@@ -11,7 +39,9 @@ to AutoTuner.process_hop() per 128-sample hop, all state held in the object.
               |       -> note mapping (MIDI, median, hysteresis)
               |       -> tuning mode -> shift (semitones), clamp, out-of-range flag
               |-> audio path: wideband voice (75 Hz high-pass only)
-                      -> TD-PSOLA (pitch_ratio = 2^(shift/12) from the detection path)
+                      -> LPC split: residual e = A(z) x  -> TD-PSOLA on e (marks by cross-correlation)
+                      -> 1/A(z) synthesis (pitch_ratio = 2^(shift/12) from the detection path)
+    (a noise suppressor sits in front of both paths)
 
 Tuning modes (spec: autotuner-target-mode-changes.md):
     MODE_NEAREST  shift = nearest (allowed) note - sung MIDI pitch   about +-0.5 st, default / evaluation baseline
@@ -62,6 +92,28 @@ class Config:
     use_filter: bool = True       # False = baseline "no filtering" comparison
     f_lo: float = 75.0
     f_hi: float = 1000.0
+    # --- noise suppression (in front of everything: detection and audio both see the cleaned signal) ---
+    denoise: bool = True
+    dn_floor_db: float = -25.0    # deepest attenuation per bin (a floor avoids "underwater" artefacts)
+    dn_bias: float = 2.5          # minimum-statistics bias: the tracked minimum under-estimates the mean noise power
+    dn_rise_db_s: float = 6.0     # how fast the noise estimate may rise (noise that gets louder, in dB per second)
+    dn_smooth: float = 0.8        # time smoothing of the power spectrum used for the noise tracker
+    dn_beta: float = 0.92         # decision-directed a-priori SNR smoothing (higher = less musical noise)
+    # --- pause gate (after the shifter): turns the remaining noise down between phrases ---
+    gate: bool = True
+    gate_depth_db: float = -25.0   # extra attenuation while nobody is singing
+    gate_open_db: float = 9.0      # level mode: open when the cleaned hop level is this far above the tracked noise floor
+    gate_snr_db: float = 6.0       # pitch-only mode: a voiced hop opens the gate only if it is also this far above
+                                   # the tracked floor (0 = off, the old gate: steady loud noise could open it)
+    gate_floor_rise_db_s: float = 10.0        # floor tracker rise rate on unvoiced hops (SNR gate on)
+    gate_floor_rise_voiced_db_s: float = 1.0  # ... on voiced hops, so a held note does not become the "floor"
+    gate_pitch_only: bool = True   # open only on voiced (pitched) hops: removes snaps/claps/knocks in pauses,
+                                   # but can clip unvoiced consonants at word starts (s, t, k, sh)
+    gate_transient_share: float = 0.9  # pitch-only gate: a hop holding > 90 % of the frame energy is a click
+    gate_hold_s: float = 0.15      # stay open this long after the last active hop (word endings, breaths)
+    gate_lookahead_s: float = 0.02 # open this much before an onset (uses the shifter's existing delay)
+    gate_attack_s: float = 0.005
+    gate_release_s: float = 0.06
     # --- audio path ---
     audio_hpf_hz: float | None = 75.0
     # --- pitch / voicing ---
@@ -73,6 +125,20 @@ class Config:
     hyst_cents: float = 35.0      # past the note boundary by this much ...
     hyst_frames: int = 3          # ... for this many consecutive frames
     scale_pcs: tuple | None = None  # allowed pitch classes; None = chromatic
+    # --- source-filter split (LPC): shift the excitation, keep the vocal-tract filter ---
+    source_filter: bool = True    # False = plain TD-PSOLA on the waveform (old)
+    lpc_order: int = 16
+    lpc_lag_hz: float = 40.0      # Gaussian lag window (smooths the spectral envelope, keeps the filter stable)
+    lpc_block: int = 32           # synthesis filter coefficients are refreshed every this many samples
+    residual_stretch: float = 0.135 # lowering, LPC mode: stretch excitation grains by (1/alpha)^this.
+                                  # 0 = short clicks with gaps (buzzy/robotic when lowering a lot),
+                                  # 1 = pulses stretched like slowed-down tape (dull, "slow-motion" sound).
+                                  # Formants are not affected either way. 0.135 -> x1.10 at -12 st.
+    max_stretch: float = 1.1      # longest grain = max_stretch * tau_max (sets the extra lookahead / delay)
+    # --- pitch marks (TD-PSOLA grain centres) ---
+    mark_mode: str = "xcorr"      # "xcorr": follow the previous grain's waveform (steady marks);
+                                  # "peak": tallest sample in a +-30 % window (old; jumps between formant peaks)
+    mark_tol: float = 0.15        # xcorr: search +-this fraction of the period around the predicted mark
     # --- correction ---
     retune_tau_s: float = 0.05    # 0 = instant snap ("T-Pain" effect)
     delay: int = 400              # PSOLA lookahead / output delay (25 ms)
@@ -93,6 +159,23 @@ class Config:
     max_shift: float = 12.0       # |d| clamp in semitones (TD-PSOLA quality limit)
     oor_margin: float = 0.5       # out-of-range hysteresis: enter > 12.5 st, leave < 11.5 st
     oor_frames: int = 6           # out-of-range debounce, consecutive voiced hops (~48 ms)
+
+    @property
+    def denoise_delay(self) -> int:
+        """Latency of the noise suppressor in samples (N - H = 24 ms), 0 if it is off."""
+        return self.N - self.H if self.denoise else 0
+
+    @property
+    def psola_delay(self) -> int:
+        """Output delay of the shifter in samples. With the LPC split the residual of a hop is only known
+        (N - H) / 2 = 192 samples behind the newest input, so the lookahead grows by that much."""
+        return (self.delay + self.grain_reach - self.tau_max
+                + ((self.N - self.H) // 2 if self.source_filter else 0))
+
+    @property
+    def grain_reach(self) -> int:
+        """Largest synthesis grain half-width = how far ahead of the finalised output marks are placed."""
+        return int(round(self.tau_max * (self.max_stretch if self.source_filter else 1.0)))
 
     @property
     def tau_min(self) -> int:
@@ -132,6 +215,40 @@ def parse_note(text) -> int:
 def design_bandpass(config: Config) -> np.ndarray:
     """4th-order Butterworth band-pass as 2 cascaded biquads (shape (2, 6))."""
     return signal.butter(2, [config.f_lo, config.f_hi], btype="bandpass", fs=config.fs, output="sos")
+
+
+# --------------------------------------------------------------------------
+# LPC helpers (vocal-tract envelope)
+# --------------------------------------------------------------------------
+def levinson(autocorr, order: int):
+    """Levinson-Durbin. Returns (a, k): A(z) = 1 + sum a[i] z^-i and the reflection coefficients k[0..order-1]."""
+    a = np.zeros(order + 1)
+    a[0] = 1.0
+    reflection = np.zeros(order)
+    error = autocorr[0]
+    for m in range(1, order + 1):
+        acc = autocorr[m] + np.dot(a[1:m], autocorr[m - 1:0:-1])
+        k_m = -acc / error
+        reflection[m - 1] = k_m
+        previous = a.copy()
+        a[1:m] = previous[1:m] + k_m * previous[m - 1:0:-1]
+        a[m] = k_m
+        error *= (1.0 - k_m * k_m)
+        if error <= 0:
+            break
+    return a, reflection
+
+
+def step_up(reflection):
+    """Reflection coefficients -> A(z) coefficients (stable for |k| < 1, also after interpolation)."""
+    order = len(reflection)
+    a = np.zeros(order + 1)
+    a[0] = 1.0
+    for m in range(1, order + 1):
+        previous = a.copy()
+        a[1:m] = previous[1:m] + reflection[m - 1] * previous[m - 1:0:-1]
+        a[m] = reflection[m - 1]
+    return a
 
 
 # --------------------------------------------------------------------------
@@ -263,6 +380,61 @@ class RangeMonitor:
 
 
 # --------------------------------------------------------------------------
+# Noise suppression: STFT Wiener gain with minimum-statistics noise tracking
+# --------------------------------------------------------------------------
+class NoiseSuppressor:
+    """Streaming spectral noise suppressor, one call per 128-sample hop.
+
+    sqrt-Hann analysis and synthesis windows, N = 512, hop H = 128 (75 % overlap, window power sums to 2).
+    Per bin k:
+        P[k]   = |X[k]|^2                                        frame power
+        Ps[k]  = a Ps[k] + (1 - a) P[k]                          smoothed over time
+        Nz[k]  = min(Nz[k] * rise, Ps[k])                        noise tracker: follows dips, creeps upward
+        gamma  = P / (bias * Nz)                                 a-posteriori SNR
+        xi     = beta G_prev^2 gamma_prev + (1 - beta) max(gamma - 1, 0)    a-priori SNR (decision-directed)
+        G      = max(xi / (1 + xi), g_floor)                     Wiener gain, then 3-tap smoothing over k
+    The noise estimate needs no voice-activity detector, so it also follows noise that changes slowly.
+    MCU: one 512-point real FFT + one inverse per hop (CMSIS arm_rfft_fast_f32), 257 bins of
+    float arithmetic; the only divisions are xi/(1+xi) and P/(bias*Nz). Output delay = N - H samples.
+    """
+
+    def __init__(self, config: Config):
+        self.config, self.N, self.H = config, config.N, config.H
+        self.window = np.sqrt(0.5 * (1.0 - np.cos(2.0 * np.pi * np.arange(self.N) / self.N)))   # sqrt-Hann
+        self.input_buffer = np.zeros(self.N)
+        self.overlap_add = np.zeros(self.N)
+        bins = self.N // 2 + 1
+        self.smoothed_power: np.ndarray | None = None
+        self.noise_power: np.ndarray | None = None
+        self.previous_gain = np.ones(bins)
+        self.previous_gamma = np.ones(bins)
+        self.gain_floor = 10.0 ** (config.dn_floor_db / 20.0)
+        self.rise = 10.0 ** (config.dn_rise_db_s / 10.0 * config.H / config.fs)
+
+    def process(self, hop):
+        config = self.config
+        self.input_buffer = np.concatenate([self.input_buffer[self.H:], hop])
+        spectrum = np.fft.rfft(self.input_buffer * self.window)
+        power = spectrum.real ** 2 + spectrum.imag ** 2
+        if self.smoothed_power is None:
+            self.smoothed_power, self.noise_power = power.copy(), power.copy()
+        else:
+            self.smoothed_power = config.dn_smooth * self.smoothed_power + (1.0 - config.dn_smooth) * power
+        self.noise_power = np.minimum(self.noise_power * self.rise, self.smoothed_power)
+        posterior_snr = power / (config.dn_bias * self.noise_power + 1e-12)
+        prior_snr = (config.dn_beta * self.previous_gain ** 2 * self.previous_gamma
+                     + (1.0 - config.dn_beta) * np.maximum(posterior_snr - 1.0, 0.0))
+        gain = np.maximum(prior_snr / (1.0 + prior_snr), self.gain_floor)
+        self.previous_gain, self.previous_gamma = gain, posterior_snr
+        padded = np.pad(gain, 1, mode="edge")
+        gain = 0.25 * padded[:-2] + 0.5 * padded[1:-1] + 0.25 * padded[2:]
+        self.overlap_add += np.fft.irfft(spectrum * gain, self.N) * self.window * 0.5
+        output = self.overlap_add[:self.H].copy()
+        self.overlap_add = np.concatenate([self.overlap_add[self.H:], np.zeros(self.H)])
+        return output
+
+
+# --------------------------------------------------------------------------
 # TD-PSOLA, streaming
 # --------------------------------------------------------------------------
 class TDPSOLA:
@@ -281,9 +453,13 @@ class TDPSOLA:
     HIST = 1024
 
     def __init__(self, config: Config, max_samples: int):
-        self.config, self.delay = config, config.delay
-        size = max_samples + 2 * config.tau_max + 16
+        self.config, self.delay = config, config.psola_delay
+        size = max_samples + 2 * config.grain_reach + 16
         self.audio = np.zeros(size)           # audio path
+        self.residual = np.zeros(size)        # LPC residual of the audio path (source_filter mode)
+        self.residual_end = 0                 # residual is known for samples < residual_end
+        self.lpc_reflection: list[np.ndarray] = []   # one reflection set per hop, centred N/2 behind its hop end
+        self.synth_past = np.zeros(config.lpc_order)  # last outputs of the synthesis filter, newest first
         self.detection = np.zeros(size)       # detection path (used for mark picking)
         self.overlap_add = np.zeros(size)     # overlap-add accumulator
         self.window_sum = np.zeros(size)      # sum of window weights (for normalisation)
@@ -294,6 +470,8 @@ class TDPSOLA:
         self.samples_emitted = 0
         self._hann_cache: dict[int, np.ndarray] = {}
         self.use_dry = np.zeros(size, dtype=bool)   # per-sample: use the dry (unshifted) input here
+        self.active = np.zeros(size, dtype=bool)    # per-sample: someone is singing / speaking here (gate)
+        self.gate_gain = 1.0
         self.dry_blend = 0.0                        # crossfade state, 0 = shifted, 1 = dry
         self.unvoiced_hops = 0
         self.smoothed_input_power = 0.0             # smoothed input / output power (level match)
@@ -308,11 +486,15 @@ class TDPSOLA:
             self._hann_cache[half_width] = window
         return window
 
-    def push(self, audio_hop, detection_hop, period: float, pitch_ratio: float, voiced: bool = True):
+    def push(self, audio_hop, detection_hop, period: float, pitch_ratio: float, voiced: bool = True,
+             reflection=None, active: bool = True):
         hop_length = len(audio_hop)
+        self.active[self.samples_received:self.samples_received + hop_length] = active
         self.audio[self.samples_received:self.samples_received + hop_length] = audio_hop
         self.detection[self.samples_received:self.samples_received + hop_length] = detection_hop
         self.samples_received += hop_length
+        if self.config.source_filter:
+            self._update_residual(reflection)
         # the voicing decision is about the frame centre (samples_received - N/2): mark that hop-wide region
         self.unvoiced_hops = 0 if voiced else self.unvoiced_hops + 1
         frame_center = self.samples_received - self.config.N // 2
@@ -324,31 +506,88 @@ class TDPSOLA:
         self._place(period, pitch_ratio)
         return self._emit()
 
+    def _update_residual(self, reflection):
+        """Inverse-filter the hop-wide region around the newest frame centre with that frame's LPC."""
+        config = self.config
+        order = config.lpc_order
+        reflection = (np.zeros(order) if reflection is None else np.asarray(reflection))
+        self.lpc_reflection.append(reflection)
+        centre = self.samples_received - config.N // 2
+        start, stop = max(centre - config.H // 2, 0), centre + config.H // 2
+        if stop <= start:
+            return
+        history = max(start - order, 0)
+        segment = signal.lfilter(step_up(reflection), [1.0], self.audio[history:stop])
+        self.residual[start:stop] = segment[start - history:]
+        self.residual_end = stop
+
+    def _mark_signal(self):
+        """(signal, number of valid samples) the pitch marks are placed on."""
+        if self.config.source_filter:
+            return self.residual, self.residual_end
+        return self.detection, self.samples_received
+
     def _extend_marks(self, period: float):
-        samples_received = self.samples_received
+        mark_signal, available = self._mark_signal()
+        samples_received = available
         if not self.analysis_marks:
             first_period = int(round(period))
             if samples_received < first_period + 1:
                 return
-            self.analysis_marks.append(int(np.argmax(self.detection[:first_period])))
+            self.analysis_marks.append(int(np.argmax(np.abs(mark_signal[:first_period]))))
+        if self.config.mark_mode == "xcorr":
+            self._extend_marks_xcorr(period)
+            return
         while True:
             last_mark = self.analysis_marks[-1]
             search_start = last_mark + max(1, int(round(0.7 * period)))
             search_end = last_mark + int(round(1.3 * period))
             if search_end >= samples_received:
                 break
-            self.analysis_marks.append(search_start + int(np.argmax(self.detection[search_start:search_end + 1])))
+            self.analysis_marks.append(search_start + int(np.argmax(mark_signal[search_start:search_end + 1])))
+
+    def _extend_marks_xcorr(self, period: float):
+        """Next mark = the position near (last mark + period) whose surrounding waveform best matches
+        the waveform around the last mark (normalised cross-correlation over one period).
+
+        Peak-picking jumps between the several peaks inside one period (formant ringing), so the grains
+        are cut at inconsistent phases and the lowered voice sounds rough and robotic. Following the
+        previous grain keeps all marks on the same feature of the waveform. MCU: about 2 x 0.3 period
+        candidates x one period of multiply-adds per mark, i.e. ~10k MACs per 10 ms, no FFT.
+        """
+        mark_signal, samples_received = self._mark_signal()
+        correlation_half = max(4, int(round(0.5 * period)))
+        tolerance = max(2, int(round(self.config.mark_tol * period)))
+        while True:
+            last_mark = self.analysis_marks[-1]
+            predicted = last_mark + max(1, int(round(period)))
+            if predicted + tolerance + correlation_half >= samples_received:
+                break
+            if last_mark - correlation_half < 0:
+                self.analysis_marks.append(predicted)
+                continue
+            reference = mark_signal[last_mark - correlation_half:last_mark + correlation_half + 1]
+            reference = reference - reference.mean()
+            reference_norm = np.sqrt(np.dot(reference, reference)) + 1e-12
+            candidates = np.arange(predicted - tolerance, predicted + tolerance + 1)
+            windows = np.lib.stride_tricks.sliding_window_view(
+                mark_signal[candidates[0] - correlation_half:candidates[-1] + correlation_half + 1],
+                2 * correlation_half + 1)
+            windows = windows - windows.mean(axis=1, keepdims=True)
+            scores = (windows @ reference) / (np.sqrt(np.einsum("ij,ij->i", windows, windows)) * reference_norm + 1e-12)
+            self.analysis_marks.append(int(candidates[int(np.argmax(scores))]))
 
     def _place(self, period: float, pitch_ratio: float):
-        config, samples_received = self.config, self.samples_received
-        finalized_until = samples_received - self.delay
+        config = self.config
+        samples_received = self._mark_signal()[1]        # grains may only use samples that are known
+        finalized_until = self.samples_received - self.delay
         if finalized_until <= 0 or not self.analysis_marks:
             return
         synthesis_period = period / pitch_ratio
         grain_half_width = int(round(period))          # grain half-width = one analysis period
         if self.next_synthesis_mark is None:
             self.next_synthesis_mark = float(self.analysis_marks[0])
-        while self.next_synthesis_mark < finalized_until + config.tau_max:
+        while self.next_synthesis_mark < finalized_until + config.grain_reach:
             mark_index = self.nearest_mark_index
             while mark_index > 0 and self.analysis_marks[mark_index] + grain_half_width >= samples_received:
                 mark_index -= 1
@@ -384,13 +623,15 @@ class TDPSOLA:
         start, stop = analysis_mark - grain_half_width, analysis_mark + grain_half_width + 1
         grain = np.zeros(2 * grain_half_width + 1)
         clipped_start = max(start, 0)
-        grain[clipped_start - start:] = self.audio[clipped_start:stop]
+        source = self.residual if self.config.source_filter else self.audio
+        grain[clipped_start - start:] = source[clipped_start:stop]
         window = self._hann(grain_half_width)
         windowed_grain = grain * window
         stretch = 1.0
-        if pitch_ratio < 1.0 and self.config.grain_stretch > 0:
-            stretch = (1.0 / pitch_ratio) ** self.config.grain_stretch
-            stretch = min(stretch, self.config.tau_max / grain_half_width)   # keep the grain inside the output lookahead
+        exponent = self.config.residual_stretch if self.config.source_filter else self.config.grain_stretch
+        if pitch_ratio < 1.0 and exponent > 0:
+            stretch = (1.0 / pitch_ratio) ** exponent
+            stretch = min(stretch, self.config.grain_reach / grain_half_width)   # keep the grain inside the output lookahead
         stretched_half_width = int(round(stretch * grain_half_width))
         if stretched_half_width != grain_half_width:
             read_positions = (np.arange(-stretched_half_width, stretched_half_width + 1)
@@ -413,8 +654,10 @@ class TDPSOLA:
             output = self.overlap_add[start:finalized_until] / np.maximum(self.window_sum[start:finalized_until], 1e-3)
         else:
             output = self.overlap_add[start:finalized_until].copy()
+        if self.config.source_filter:
+            output = self._synthesize(output, start)       # excitation -> speech through the vocal-tract filter
         if not self.config.dry_unvoiced:
-            return self._level(output, start, finalized_until)
+            return self._gate(self._level(output, start, finalized_until), start, finalized_until)
         # crossfade between the shifted output and the dry input (linear ramp, dry_fade samples)
         step = 1.0 / max(self.config.dry_fade, 1)
         blend = np.empty(len(output))
@@ -423,8 +666,66 @@ class TDPSOLA:
             blend_state = min(blend_state + step, 1.0) if wants_dry else max(blend_state - step, 0.0)
             blend[i] = blend_state
         self.dry_blend = blend_state
-        return self._level((1.0 - blend) * output + blend * self.audio[start:finalized_until],
-                           start, finalized_until)
+        return self._gate(self._level((1.0 - blend) * output + blend * self.audio[start:finalized_until],
+                                      start, finalized_until), start, finalized_until)
+
+    def _synthesize(self, excitation, start: int):
+        """All-pole synthesis 1/A(z) over the finalised excitation, in blocks of lpc_block samples.
+
+        Each block uses reflection coefficients interpolated linearly between the two nearest analysis
+        frame centres (stable for |k| < 1). The filter keeps its own past outputs between blocks, so the
+        formants keep ringing through the gaps that a lowered pitch leaves between excitation pulses.
+        MCU: 16 multiply-adds per sample + one step-up (~140 MACs) per block.
+        """
+        config = self.config
+        order, block = config.lpc_order, config.lpc_block
+        count = len(self.lpc_reflection)
+        output = np.empty(len(excitation))
+        position = 0
+        while position < len(excitation):
+            length = min(block, len(excitation) - position)
+            middle = start + position + length / 2.0
+            hop_index = (middle + config.N // 2) / config.H - 1.0
+            lower = int(np.clip(np.floor(hop_index), 0, count - 1))
+            upper = min(lower + 1, count - 1)
+            fraction = float(np.clip(hop_index - lower, 0.0, 1.0))
+            reflection = (1.0 - fraction) * self.lpc_reflection[lower] + fraction * self.lpc_reflection[upper]
+            denominator = step_up(reflection)
+            initial = signal.lfiltic([1.0], denominator, self.synth_past)
+            filtered, _ = signal.lfilter([1.0], denominator, excitation[position:position + length], zi=initial)
+            output[position:position + length] = filtered
+            self.synth_past = np.concatenate([filtered[::-1], self.synth_past])[:order]
+            position += length
+        return output
+
+    def _gate(self, output, start: int, stop: int):
+        """Pause gate: full gain near active hops (hold after, lookahead before), gate_depth_db elsewhere.
+
+        The decision for sample n looks at active[n - hold : n + lookahead]; the lookahead is free because
+        output sample n is only emitted psola_delay samples after it arrived. Gain moves with a one-pole
+        attack/release. MCU: a counter per hop + one multiply per sample.
+        """
+        config = self.config
+        if not config.gate or len(output) == 0:
+            return output
+        fs = config.fs
+        hold, ahead = int(config.gate_hold_s * fs), int(config.gate_lookahead_s * fs)
+        lo, hi = max(start - hold, 0), min(stop + ahead, self.samples_received)
+        window = self.active[lo:hi].astype(np.int32)
+        cumulative = np.concatenate([[0], np.cumsum(window)])
+        index = np.arange(start, stop)
+        a = np.clip(index - hold - lo, 0, len(window))
+        b = np.clip(index + ahead + 1 - lo, 0, len(window))
+        target = np.where(cumulative[b] - cumulative[a] > 0, 1.0, 10.0 ** (config.gate_depth_db / 20.0))
+        attack = 1.0 - np.exp(-1.0 / (config.gate_attack_s * fs))
+        release = 1.0 - np.exp(-1.0 / (config.gate_release_s * fs))
+        gains = np.empty(len(output))
+        gain = self.gate_gain
+        for i, wanted in enumerate(target):                    # MCU: same per-sample slew
+            gain += (attack if wanted > gain else release) * (wanted - gain)
+            gains[i] = gain
+        self.gate_gain = gain
+        return output * gains
 
     def _level(self, output, start: int, stop: int):
         """Match the output level to the (time-aligned) input level.
@@ -466,6 +767,17 @@ class AutoTuner:
                              if config.audio_hpf_hz else None)
         self.highpass_state = (np.zeros((self.highpass_sos.shape[0], 2))
                                if self.highpass_sos is not None else None)
+        self.denoiser = NoiseSuppressor(config) if config.denoise else None
+        self.audio_frame = np.zeros(config.N)
+        self.lpc_window = np.hanning(config.N)
+        lag_index = np.arange(config.lpc_order + 1)
+        self.lpc_lag_window = np.exp(-0.5 * (2.0 * np.pi * config.lpc_lag_hz * lag_index / config.fs) ** 2)
+        self.last_reflection = np.zeros(config.lpc_order)
+        self.gate_floor_power: float | None = None             # tracked noise floor of the cleaned signal
+        self.gate_smoothed_power = 0.0
+        self.gate_rise = 10.0 ** (3.0 / 10.0 * config.H / config.fs)   # floor may rise 3 dB/s (old gate)
+        self.gate_rise_unvoiced = 10.0 ** (config.gate_floor_rise_db_s / 10.0 * config.H / config.fs)
+        self.gate_rise_voiced = 10.0 ** (config.gate_floor_rise_voiced_db_s / 10.0 * config.H / config.fs)
         self.frame = np.zeros(config.N)
         self.hop_energy = np.zeros(config.N // config.H)   # sum of squares of the raw input, last N samples
         self.samples_seen = 0
@@ -483,6 +795,18 @@ class AutoTuner:
         self.set_target(config.target_midi)
         self.range_monitor = RangeMonitor(config)
 
+    def _lpc(self, frame):
+        """Reflection coefficients of the newest N-sample audio frame (kept from before if the frame is silent)."""
+        config = self.config
+        windowed = frame * self.lpc_window
+        autocorr = np.correlate(windowed, windowed, "full")[config.N - 1:config.N + config.lpc_order]
+        if autocorr[0] < 1e-9:
+            return self.last_reflection
+        autocorr = autocorr * self.lpc_lag_window
+        autocorr[0] *= 1.0 + 1e-4                              # white-noise correction (-40 dB)
+        self.last_reflection = levinson(autocorr, config.lpc_order)[1]
+        return self.last_reflection
+
     def set_mode(self, mode: int):
         if mode not in MODE_NAMES:
             raise ValueError(f"unknown mode {mode}")
@@ -497,6 +821,8 @@ class AutoTuner:
     def process_hop(self, hop_samples):
         config = self.config
         hop_samples = np.asarray(hop_samples, dtype=float)
+        if self.denoiser is not None:
+            hop_samples = self.denoiser.process(hop_samples)   # everything below sees the cleaned signal
         if config.use_filter:
             detection_hop, self.bandpass_state = signal.sosfilt(self.bandpass_sos, hop_samples,
                                                                 zi=self.bandpass_state)
@@ -557,7 +883,32 @@ class AutoTuner:
                     target=target_note if target_note is not None else -1,
                     mode=mode, d_raw=raw_shift, d=shift, d_s=self.smoothed_shift, oor=out_of_range,
                     status=status, alpha=pitch_ratio, T=period)
-        output = self.psola.push(audio_hop, detection_hop, period, pitch_ratio, voiced) if self.synthesize else None
+        hop_power = float(np.mean(hop_samples ** 2)) + 1e-14       # cleaned signal, before the filters
+        self.gate_smoothed_power += 0.3 * (hop_power - self.gate_smoothed_power)   # ~3-hop average
+        hop_power = self.gate_smoothed_power
+        snr_gate = config.gate_pitch_only and config.gate_snr_db > 0
+        if hop_power > 1e-9:                                         # ignore digital silence (start-up, padding)
+            if self.gate_floor_power is None:
+                self.gate_floor_power = hop_power
+            if snr_gate:
+                rise = self.gate_rise_voiced if voiced else self.gate_rise_unvoiced
+            else:
+                rise = self.gate_rise
+            self.gate_floor_power = min(self.gate_floor_power * rise, hop_power)
+        # a click/snap puts most of the frame's energy into one 8 ms hop; a sung note spreads it evenly
+        transient = self.hop_energy.max() > config.gate_transient_share * (self.hop_energy.sum() + 1e-20)
+        gate_voiced = voiced and not (config.gate_pitch_only and transient)
+        if snr_gate:                                                 # and clearly above the background
+            gate_voiced = gate_voiced and (self.gate_floor_power is not None and
+                                           hop_power > self.gate_floor_power * 10.0 ** (config.gate_snr_db / 10.0))
+        active = gate_voiced or (not config.gate_pitch_only and self.gate_floor_power is not None and
+                            hop_power > self.gate_floor_power * 10.0 ** (config.gate_open_db / 10.0))
+        reflection = None
+        if config.source_filter:
+            self.audio_frame = np.concatenate([self.audio_frame[config.H:], audio_hop])
+            reflection = self._lpc(self.audio_frame)
+        output = (self.psola.push(audio_hop, detection_hop, period, pitch_ratio, voiced, reflection, active)
+                  if self.synthesize else None)
         return info, output
 
 
@@ -570,7 +921,8 @@ def run(samples, config: Config | None = None, synthesize: bool = True, commands
     config = config or Config()
     samples = np.asarray(samples, dtype=float)
     signal_length, hop_length = len(samples), config.H
-    total_length = int(np.ceil((signal_length + config.delay + 2 * hop_length) / hop_length)) * hop_length
+    pre_delay = config.denoise_delay
+    total_length = int(np.ceil((signal_length + pre_delay + config.psola_delay + 2 * hop_length) / hop_length)) * hop_length
     padded_samples = np.zeros(total_length)
     padded_samples[:signal_length] = samples
     tuner = AutoTuner(config, synthesize=synthesize, max_samples=total_length)
@@ -588,7 +940,7 @@ def run(samples, config: Config | None = None, synthesize: bool = True, commands
         if synthesize:
             output_chunks.append(output_chunk)
     track = {key: np.array([info[key] for info in hop_infos]) for key in hop_infos[0]}
-    output = np.concatenate(output_chunks)[:signal_length] if synthesize else None
+    output = np.concatenate(output_chunks)[pre_delay:pre_delay + signal_length] if synthesize else None
     return output, track
 
 
@@ -611,6 +963,33 @@ def load_wav(path: str, sample_rate: int):
         divisor = gcd(file_sample_rate, sample_rate)
         samples = signal.resample_poly(samples, sample_rate // divisor, file_sample_rate // divisor)
     return samples
+
+
+def make_louder(samples, sample_rate: int, gain_db: float | None = None, target_dbfs: float = -18.0,
+                ceiling_dbfs: float = -1.0, max_gain_db: float = 30.0):
+    """Output gain + soft limiter.
+
+    gain_db None = automatic: the loud parts (95th percentile of the 100 ms energy) are brought to
+    target_dbfs, at most +max_gain_db. Then a soft limiter keeps peaks under ceiling_dbfs:
+    below half the ceiling the signal is untouched, above it tanh bends it smoothly towards the ceiling,
+    so single clicks do not limit how loud the voice can be. Returns (output, applied gain in dB).
+    MCU/laptop: one multiply + one tanhf (or a small table) per sample.
+    """
+    samples = np.asarray(samples, dtype=float)
+    if gain_db is None:
+        window = max(1, int(0.1 * sample_rate))
+        energy = np.convolve(samples ** 2, np.ones(window) / window, mode="same")
+        loud_dbfs = 10.0 * np.log10(np.percentile(energy, 95) + 1e-12)
+        gain_db = float(np.clip(target_dbfs - loud_dbfs, 0.0, max_gain_db))
+    louder = samples * 10.0 ** (gain_db / 20.0)
+    ceiling = 10.0 ** (ceiling_dbfs / 20.0)
+    knee = 0.5 * ceiling
+    magnitude = np.abs(louder)
+    over = magnitude > knee
+    limited = louder.copy()
+    limited[over] = np.sign(louder[over]) * (knee + (ceiling - knee)
+                                             * np.tanh((magnitude[over] - knee) / (ceiling - knee)))
+    return limited, gain_db
 
 
 def save_wav(path: str, samples, sample_rate: int):
@@ -691,7 +1070,7 @@ def plot_track(path: str, track, config: Config, title: str = ""):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    time_s = (track["n_end"] - config.N // 2) / config.fs
+    time_s = (track["n_end"] - config.N // 2 - config.denoise_delay) / config.fs
     voiced = track["voiced"].astype(bool)
     sung_pitch = np.where(voiced, track["m_s"], np.nan)
     target_pitch = np.where(voiced & (track["target"] >= 0), track["target"], np.nan)
@@ -725,10 +1104,28 @@ def main():
     parser.add_argument("--scale", choices=list(SCALES), default="chromatic", help="nearest mode only")
     parser.add_argument("--key", default="C", choices=NOTE_NAMES)
     parser.add_argument("--retune", type=float, default=0.05, help="retune time constant in s (0 = snap)")
-    parser.add_argument("--stretch", type=float, default=Config.grain_stretch,
-                        help="lowering only, 0..1: 0 = plain TD-PSOLA (robotic at big shifts), "
-                             "1 = smooth but deeper formants (default %(default)s)")
+    parser.add_argument("--stretch", type=float, default=None,
+                        help="lowering only, 0..1: how much the grains are stretched. 0 = buzzy/robotic at big "
+                             "shifts; 1 = slowed-down-tape sound (and, with --classic, deeper formants). "
+                             f"Default {Config.residual_stretch} (LPC) / {Config.grain_stretch} (--classic)")
     parser.add_argument("--no-filter", action="store_true", help="disable the detection band-pass")
+    parser.add_argument("--no-denoise", action="store_true", help="disable the noise suppressor")
+    parser.add_argument("--gate-db", type=float, default=Config.gate_depth_db,
+                        help="extra attenuation between phrases (default %(default)s; 0 = gate off)")
+    parser.add_argument("--gate-pitch-only", action="store_true",
+                        help="(default) gate opens only when a pitch is detected: cuts snaps, taps, clicks in pauses")
+    parser.add_argument("--gate-snr", type=float, default=Config.gate_snr_db,
+                        help="pitch-only gate: also require this many dB above the background floor "
+                             "(default %(default)s; 0 = old gate, which loud steady noise can open)")
+    parser.add_argument("--gate-level", action="store_true",
+                        help="gate also opens on loud sounds (keeps word-initial s/t/k, but lets snaps through)")
+    parser.add_argument("--classic", action="store_true",
+                        help="v1 shifter: TD-PSOLA on the waveform with peak-picked marks (for A/B)")
+    parser.add_argument("--denoise-db", type=float, default=Config.dn_floor_db,
+                        help="noise suppressor floor in dB (default %(default)s; -35 = stronger, -15 = gentler)")
+    parser.add_argument("--loud", nargs="?", const="auto", metavar="DB",
+                        help="make the output louder (soft limiter keeps peaks under -1 dBFS). "
+                             "No value = automatic (loud parts to -18 dBFS), or give the gain in dB, e.g. --loud 12")
     parser.add_argument("--plot", help="save a pitch plot (out-of-range shaded) to this PNG")
     parser.add_argument("--display", choices=["oled", "lcd"],
                         help="print the display text about 10 times a second")
@@ -757,10 +1154,19 @@ def main():
         parser.error(str(error))
     if not TARGET_MIN <= fixed_target <= TARGET_MAX:
         parser.error(f"--target must be between {note_name(TARGET_MIN)} and {note_name(TARGET_MAX)}")
-    if not 0.0 <= args.stretch <= 1.0:
+    if args.stretch is not None and not 0.0 <= args.stretch <= 1.0:
         parser.error("--stretch must be between 0 and 1")
+    stretch_options = {}
+    if args.stretch is not None:
+        stretch_options = ({"grain_stretch": args.stretch} if args.classic
+                           else {"residual_stretch": args.stretch,
+                                 "max_stretch": max(1.0, min(2.0, 2.0 ** args.stretch))})
     config = Config(scale_pcs=pitch_classes, retune_tau_s=args.retune, use_filter=not args.no_filter,
-                    mode=mode, target_midi=fixed_target, grain_stretch=args.stretch)
+                    denoise=not args.no_denoise, dn_floor_db=args.denoise_db,
+                    gate=args.gate_db < 0, gate_depth_db=min(args.gate_db, 0.0),
+                    gate_pitch_only=not args.gate_level, gate_snr_db=args.gate_snr,
+                    source_filter=not args.classic, mark_mode="peak" if args.classic else "xcorr",
+                    mode=mode, target_midi=fixed_target, **stretch_options)
     mode_text = (f"mode {MODE_NAMES[mode]}"
                  + (f", target {note_name(fixed_target)}" if mode == MODE_FIXED else ""))
 
@@ -793,6 +1199,13 @@ def main():
         parser.error("give an input wav or use --demo")
     samples = load_wav(args.input, config.fs)
     output, track = run(samples, config)
+    if args.loud is not None:
+        try:
+            requested_gain = None if args.loud == "auto" else float(args.loud)
+        except ValueError:
+            parser.error("--loud takes a number of dB, e.g. --loud 12")
+        output, applied_gain = make_louder(output, config.fs, requested_gain)
+        print(f"output gain {applied_gain:+.1f} dB (peaks soft-limited at -1 dBFS)")
     save_wav(args.output, output, config.fs)
     if args.golden:
         export_golden(args.golden, samples, config)
@@ -809,7 +1222,7 @@ def main():
         for hop_index in range(0, len(track["n_end"]), hops_per_row):
             info = {key: track[key][hop_index] for key in track}
             line1, line2 = display_lines(info, width)
-            print(f"{track['n_end'][hop_index] / config.fs:6.2f}s | {line1:<{width}} | {line2:<{width}} |")
+            print(f"{(track['n_end'][hop_index] - config.denoise_delay) / config.fs:6.2f}s | {line1:<{width}} | {line2:<{width}} |")
     if args.plot:
         plot_track(args.plot, track, config, f"{os.path.basename(args.input)}, {mode_text}")
         print("plot ->", args.plot)

@@ -17,26 +17,21 @@ static void row(oled_fb_t *fb, int index, const char *label, const char *value)
     oled_fb_text(fb, OLED_WIDTH - oled_fb_text_width(value, VALUE_SCALE), y, value, VALUE_SCALE);
 }
 
-void app_screen_draw(oled_fb_t *fb, int mode, int target_midi, int oor_percent)
+/* MIDI note -> "C#4", or "-" for none. buf needs 8 bytes. */
+static const char *note_or_dash(int midi, char *buf)
 {
-    char target[8], percent[6];
+    if (midi >= 0) return at_note_name(midi, buf);
+    buf[0] = '-';
+    buf[1] = '\0';
+    return buf;
+}
+
+void app_screen_draw(oled_fb_t *fb, int mode, int target_midi, int sung_midi)
+{
+    char target[8], sung[8];
     oled_fb_clear(fb);
 
     row(fb, 0, "mode:", mode == AT_MODE_FIXED ? "FIXED" : "NEAREST");
-
-    if (target_midi >= 0) at_note_name(target_midi, target);
-    else { target[0] = '-'; target[1] = '\0'; }
-    row(fb, 1, "target:", target);
-
-    if (oor_percent >= 0) {
-        int p = oor_percent > 100 ? 100 : oor_percent, i = 0;
-        if (p >= 100) percent[i++] = '1';
-        if (p >= 10)  percent[i++] = (char)('0' + (p / 10) % 10);
-        percent[i++] = (char)('0' + p % 10);
-        percent[i++] = '%';
-        percent[i] = '\0';
-    } else {
-        percent[0] = '-'; percent[1] = '\0';
-    }
-    row(fb, 2, "oor_percent:", percent);
+    row(fb, 1, "target:", note_or_dash(target_midi, target));
+    row(fb, 2, "sung:", note_or_dash(sung_midi, sung));
 }

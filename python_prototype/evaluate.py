@@ -1,12 +1,16 @@
 """Noise-robustness evaluation (design doc section 9, proposal section 4).
 
-    python evaluate.py [--seeds 3] [--vowel a]
+    python evaluate.py [--seeds 3] [--vowel a]                  # synthetic phrase, exact F0 truth -> results/
+    python evaluate.py --wav wav_files/introduce.wav [--seeds 5] # real recording, pYIN reference -> results/introduce/
 
-Mixes a synthetic sung phrase (exact F0 truth) with white / pink / fan+hum /
-babble noise at fixed SNRs and compares detection with and without the
-75 Hz-1 kHz band-pass.  Writes results/ (CSV, three PNG figures, markdown table).
+Mixes the test signal with white / pink / fan+hum / babble noise at fixed SNRs and compares
+detection with and without the 75 Hz-1 kHz band-pass.  Writes CSV, PNG figures, markdown table.
+With --wav the reference F0 comes from pYIN (wav_reference.py), "clean" means the recording as it
+is (with its own room noise), and false alarms are counted on its background-only frames.
 
-Frame bookkeeping: hop i ends at n_end=(i+1)*H and covers [n_end-N, n_end).
+Frame bookkeeping: hop i ends at n_end=(i+1)*H. Detection runs after the noise suppressor, which
+delays the signal by config.denoise_delay samples, so hop i analyses the input samples
+[n_end-delay-N, n_end-delay).
   voiced frame  : truth F0 > 0 for the whole frame
   silent frame  : truth F0 == 0 for the whole frame (noise only)
   steady frame  : whole frame is >0.1 s into a note (intended note unambiguous)
@@ -28,6 +32,8 @@ import synth
 from autotuner import Config, design_bandpass, hz_to_midi, run
 
 OUT = "results"
+TRUTH_LABEL = "truth"
+YLIM = (40, 90)
 NOISES = ["white", "pink", "fan_hum", "babble"]
 SNRS = [None, 20, 10, 0, -5]          # None = clean
 BLUE, ORANGE = "#2a78d6", "#eb6834"   # categorical slots 1-2 (validated)
@@ -37,14 +43,19 @@ INK, MUTED, GRID, SURFACE = "#0b0b0b", "#898781", "#e1e0d9", "#fcfcfb"
 def frame_masks(sig, tr, config):
     N = config.N
     L = len(sig["f0"])
-    ne = tr["n_end"]
+    ne = tr["n_end"] - config.denoise_delay
     inside = (ne <= L) & (ne - N >= 0)
     ne_c, st_c = np.minimum(ne, L), np.clip(ne - N, 0, L)
     cv = np.concatenate([[0], np.cumsum(sig["f0"] > 0)])
     cs = np.concatenate([[0], np.cumsum(sig["steady"])])
     nv, ns = cv[ne_c] - cv[st_c], cs[ne_c] - cs[st_c]
     centre = np.minimum(ne - N // 2, L - 1)
-    return dict(voiced=inside & (nv == N), silent=inside & (nv == 0),
+    if "background" in sig:                      # real recording: noise-only = no speech in the whole frame
+        cb = np.concatenate([[0], np.cumsum(sig["background"])])
+        silent = inside & ((cb[ne_c] - cb[st_c]) == N)
+    else:
+        silent = inside & (nv == 0)
+    return dict(voiced=inside & (nv == N), silent=silent,
                 steady=inside & (ns == N), centre=centre)
 
 
@@ -78,8 +89,7 @@ def snr_db(clean, noise, active, sos=None, skip=1600):
     return 10 * np.log10(np.mean(clean[a] ** 2) / np.mean(noise[skip:] ** 2))
 
 
-def sweep(config, vowel, seeds):
-    sig = synth.make_test_signal(config.fs, vowel=vowel)
+def sweep(config, sig, seeds):
     active = sig["f0"] > 0
     sos = design_bandpass(config)
     rows = []
@@ -191,16 +201,16 @@ def fig_tracks(sig, config):
             x, _, _ = synth.add_noise(sig["x"], kind, 0, active, np.random.default_rng(100))
         truth = np.where(sig["f0"] > 0, hz_to_midi(np.maximum(sig["f0"], 1)), np.nan)
         t = np.arange(len(truth)) / config.fs
-        ax.plot(t, truth, color=MUTED, lw=1.2, label="truth")
         for filt, col, mk, lab in [(False, ORANGE, "x", "no filter"), (True, BLUE, "o", "band-pass")]:
             _, tr = run(x, replace(config, use_filter=filt), synthesize=False)
-            tc = (tr["n_end"] - config.N // 2) / config.fs
+            tc = (tr["n_end"] - config.N // 2 - config.denoise_delay) / config.fs
             ax.plot(tc, np.where(tr["voiced"], hz_to_midi(tr["f0"]), np.nan), ls="none",
                     marker=mk, ms=3, color=col, label=lab, alpha=0.9)
+        ax.plot(t, truth, color=INK, lw=1.6, label=TRUTH_LABEL, zorder=5)   # on top of the dots
         ax.set_ylabel("MIDI note", color=INK, fontsize=9)
         ax.set_title(name, color=INK, fontsize=10, loc="left")
-        ax.set_ylim(40, 90)
-    axes[0].legend(frameon=False, fontsize=8, ncol=3, loc="upper left")
+        ax.set_ylim(*YLIM)
+    axes[0].legend(frameon=True, facecolor=SURFACE, edgecolor=GRID, fontsize=8, ncol=3, loc="upper right")
     axes[-1].set_xlabel("time (s)", color=MUTED, fontsize=8)
     fig.tight_layout()
     fig.savefig(f"{OUT}/fig_tracks.png", dpi=150, facecolor=SURFACE)
@@ -220,9 +230,10 @@ def fig_spectra(sig, config):
         _, _, nz = synth.add_noise(sig["x"], kind, 0, active, np.random.default_rng(100))
         f, p = signal.welch(nz, config.fs, nperseg=2048)
         ax.semilogx(f[1:], 10 * np.log10(p[1:]), color=cols[kind], lw=1.2, label=kind.replace("_", " + "))
-    ax.set_ylim(-120, -30)
+    if "background" not in sig:
+        ax.set_ylim(-120, -30)
     ax.axvspan(config.f_lo, config.f_hi, color=GRID, alpha=0.5, lw=0)
-    ax.text(config.f_lo * 1.1, -117, "detection pass-band", color=MUTED, fontsize=8)
+    ax.text(config.f_lo * 1.1, ax.get_ylim()[0] + 3, "detection pass-band", color=MUTED, fontsize=8)
     ax.set_xlabel("frequency (Hz)", color=MUTED, fontsize=8)
     ax.set_ylabel("PSD (dB/Hz), noise at 0 dB SNR", color=INK, fontsize=9)
     ax.legend(frameon=False, fontsize=8, ncol=5, loc="upper center", bbox_to_anchor=(0.5, 1.12))
@@ -259,11 +270,22 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, default=3)
     ap.add_argument("--vowel", default="a")
+    ap.add_argument("--wav", help="evaluate on a real recording (pYIN reference) instead of the synthetic phrase")
     a = ap.parse_args()
-    os.makedirs(OUT, exist_ok=True)
+    global OUT, TRUTH_LABEL, YLIM
     config = Config()
+    if a.wav:
+        import wav_reference
+        sig = wav_reference.make_wav_signal(a.wav, config.fs)
+        OUT = os.path.join("results", os.path.splitext(os.path.basename(a.wav))[0])
+        TRUTH_LABEL = "reference (pYIN)"
+        m = hz_to_midi(sig["f0"][sig["f0"] > 0])
+        YLIM = (np.floor(m.min()) - 6, 86)
+    else:
+        sig = synth.make_test_signal(config.fs, vowel=a.vowel)
+    os.makedirs(OUT, exist_ok=True)
     print("sweeping...")
-    sig, rows = sweep(config, a.vowel, a.seeds)
+    sig, rows = sweep(config, sig, a.seeds)
     gains, pred = fig_snr_gain(rows, config)
     fig_sweep(rows)
     fig_tracks(sig, config)

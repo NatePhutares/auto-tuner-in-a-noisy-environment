@@ -6,8 +6,8 @@
  *   1. applies any command line received from the laptop,
  *   2. runs autotuner_process_hop() (int16 / 32768 -> float, the same scaling as the recorded WAVs),
  *   3. sends the tuned hop with pitch / target / status over UART,
- *   4. counts the out-of-range share and redraws the OLED (5 times a second, and right after a
- *      command so the screen confirms it).
+ *   4. counts the out-of-range share (for Live Expressions) and redraws the OLED: mode, target and
+ *      the note being sung (5 times a second, and right after a command so the screen confirms it).
  *
  * Everything worth watching is volatile so it can be added to CubeIDE "Live Expressions".
  */
@@ -26,7 +26,7 @@ extern volatile uint32_t app_cycles_max;    /* worst case since reset (write 0 t
 extern volatile uint32_t app_deadline_miss; /* hops that took longer than APP_HOP_CYCLES      */
 extern volatile uint32_t app_cmd_ok, app_cmd_rejected;   /* command lines accepted / rejected */
 extern volatile uint32_t app_oor_voiced;    /* fixed mode: voiced hops since the last mode/target change */
-extern volatile uint32_t app_oor_count;     /* ... of which out of range (oor_percent on the OLED)        */
+extern volatile uint32_t app_oor_count;     /* ... of which out of range (oor % = count / voiced)        */
 extern at_info_t         app_info;          /* last hop's pitch / target / status             */
 
 void app_init(UART_HandleTypeDef *huart, I2C_HandleTypeDef *hi2c);

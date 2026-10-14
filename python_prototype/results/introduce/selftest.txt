@@ -1,0 +1,56 @@
+[PASS] tau range 16..200  16..200
+[PASS] hop deadline 8 ms  
+[PASS] N >= 2 periods of 80 Hz  400 <= 512
+[PASS] band-pass is 2 biquads  
+[PASS] -3 dB at 75 Hz and 1 kHz  -3.01, -3.01 dB
+[PASS] 50 Hz mains attenuated > 8 dB  -8.5 dB
+       noise bandwidth of the filter: 1012 Hz -> white-noise gain 9.0 dB (design doc: 925 Hz, 9.4 dB)
+[PASS] detector within 5 cents, 82..990 Hz  worst 2.15 cents
+[PASS] digital silence -> no pitch  
+[PASS] white noise rarely voiced (<5%)  3.5% of 200 frames
+[PASS] hysteresis holds target at 0.55 st  targets [60]
+[PASS] switches after > 35 cents past boundary  final 61
+[PASS] C major snaps C# -> C or D  
+[PASS] median removes a one-frame octave jump  m_s 60.00
+[PASS] retune 0 ms: mean cents distance to the nearest note drops (pYIN, 114 frames)  25.2 -> 14.1 cents (median 28.7 -> 8.7)
+[PASS] retune 10 ms: mean cents distance to the nearest note drops (pYIN, 108 frames)  25.2 -> 18.7 cents (median 28.7 -> 11.3)
+[PASS] retune 50 ms: mean cents distance to the nearest note drops (pYIN, 106 frames)  25.0 -> 23.7 cents (median 28.7 -> 21.3)
+[PASS] output level within 1 dB of input on voiced speech (noise suppressor off)  -0.43 dB
+[INFO] level with the noise suppressor on (room noise removed as well)  -4.34 dB
+[PASS] no NaN/inf in output  
+[PASS] streaming output == offline output  
+[PASS] PSOLA only touches the last 1024 samples  (asserted inside TDPSOLA._ola on every grain)
+[PASS] note parsing C6=84, F#3=54, Bb2=46  
+       recording: median sung note F#2 (42), voiced reference 2.67..4.68 s
+[FAIL] fixed F#2 -> A2 (45): shift +3 st, out_of_range clear  flag set (on 17% of voiced hops)
+[FAIL]   output pitch reaches 45 within 15 cents  d +3 st, output 44.59, voiced 54%, level -4.6 dB
+[FAIL] fixed F#2 -> C#3 (49): shift +7 st, out_of_range clear  flag set (on 17% of voiced hops)
+[FAIL]   output pitch reaches 49 within 15 cents  d +7 st, output 48.69, voiced 46%, level -4.7 dB
+[FAIL] fixed F#2 -> F#3 (54): shift +12 st, out_of_range clear  flag set (on 69% of voiced hops)
+[FAIL]   output pitch reaches 54 within 15 cents  d +12 st, output 53.79, voiced 51%, level -4.6 dB
+[FAIL] fixed F#2 -> C#2 (37): shift -5 st, out_of_range clear  flag set (on 17% of voiced hops)
+[FAIL]   output pitch reaches 37 within 15 cents  d -5 st, output 36.89, voiced 43%, level -4.4 dB
+[FAIL] fixed F#2 -> F#1 (30): shift -12 st, out_of_range clear  flag set (on 55% of voiced hops)
+[FAIL]   output pitch reaches 30 within 15 cents  d -12 st, output 30.29, voiced 32%, level -4.2 dB
+[FAIL] fixed F#2 -> A4 (69): shift +12 st, out_of_range set  flag clear (on 86% of voiced hops)
+[INFO]   output pitch 53.69 (not checked)  d +12 st, output 53.69, voiced 54%, level -4.7 dB
+[PASS] fixed F#2 -> C1 (24): shift -12 st, out_of_range set  flag set (on 100% of voiced hops)
+[INFO]   output pitch 30.09 (not checked)  d -12 st, output 30.09, voiced 34%, level -4.2 dB
+[FAIL] grain_stretch 0.0: F#2 -> B1 still lands on 35  output 34.69
+[FAIL] grain_stretch 1.0: F#2 -> B1 still lands on 35  output 34.69
+[PASS] status byte on voiced out-of-range hops = 0x07  ['0x7']
+[PASS] status byte keeps out_of_range on unvoiced hops (0x03)  
+[PASS] out-of-range enters only after 6 hops above 12.5  
+[PASS] stays set between 11.5 and 12.5 and on unvoiced hops  
+[PASS] clears after 6 hops below 11.5  
+[PASS] 12.2 st never sets the flag  
+[PASS] debounce: interrupted runs do not set the flag  
+[PASS] mode command applied from the next hop  
+[PASS] nearest mode clears out_of_range  
+[FAIL] nearest mode |d| <= 0.5 st  max 12.00 st, 57% of voiced hops above 0.5
+[PASS] OLED: 'Target: C6 [FIXED]' / 'Sung: A3 OUT OF RANGE'  'Target: C6    [FIXED]' 'Sung: A3 OUT OF RANGE'
+[PASS] OLED: '+3 st'  'Sung: A3        +3 st'
+[PASS] OLED: nearest '-32 c'  'Target: D3  [NEAREST]' 'Sung: D3        -32 c'
+[PASS] LCD1602 lines fit 16 chars  'T:C6     [FIXED]' 'S:A3   OUT RANGE' 'T:C#4  [NEAREST]' 'S:C#4      -20 c'
+
+14 FAILED: ['fixed F#2 -> A2 (45): shift +3 st, out_of_range clear', '  output pitch reaches 45 within 15 cents', 'fixed F#2 -> C#3 (49): shift +7 st, out_of_range clear', '  output pitch reaches 49 within 15 cents', 'fixed F#2 -> F#3 (54): shift +12 st, out_of_range clear', '  output pitch reaches 54 within 15 cents', 'fixed F#2 -> C#2 (37): shift -5 st, out_of_range clear', '  output pitch reaches 37 within 15 cents', 'fixed F#2 -> F#1 (30): shift -12 st, out_of_range clear', '  output pitch reaches 30 within 15 cents', 'fixed F#2 -> A4 (69): shift +12 st, out_of_range set', 'grain_stretch 0.0: F#2 -> B1 still lands on 35', 'grain_stretch 1.0: F#2 -> B1 still lands on 35', 'nearest mode |d| <= 0.5 st']
